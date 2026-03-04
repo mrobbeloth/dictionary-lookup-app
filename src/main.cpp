@@ -10,11 +10,19 @@
 #include <libsoup/soup.h>
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using json = nlohmann::json;
+
+// RAII wrapper for GObject references
+struct GObjectUnref {
+    void operator()(gpointer obj) const { g_object_unref(obj); }
+};
+template <typename T>
+using GObjectPtr = std::unique_ptr<T, GObjectUnref>;
 
 // Supported languages: display name → API language code
 static const std::vector<std::pair<std::string, std::string>> LANGUAGES = {
@@ -44,8 +52,8 @@ struct AppData {
 
 // Payload carried from the lookup dispatch to the async callback
 struct LookupPayload {
-    AppData    *app;
-    SoupMessage *msg;   // kept alive for status-code inspection
+    AppData               *app;
+    GObjectPtr<SoupMessage> msg;   // RAII-managed reference
 };
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -152,8 +160,11 @@ static void on_soup_response(GObject *source,
                              GAsyncResult *result,
                              gpointer user_data)
 {
-    auto *payload = static_cast<LookupPayload *>(user_data);
-    AppData *app  = payload->app;
+    // Reclaim ownership so the payload (and its GObjectPtr<SoupMessage>)
+    // are automatically freed when this scope exits.
+    std::unique_ptr<LookupPayload> payload(
+        static_cast<LookupPayload *>(user_data));
+    AppData *app = payload->app;
 
     GError *error = nullptr;
     GBytes *bytes = soup_session_send_and_read_finish(
@@ -166,8 +177,6 @@ static void on_soup_response(GObject *source,
         std::string msg = std::string("Network error: ") + error->message;
         gtk_text_buffer_set_text(app->result_buffer, msg.c_str(), -1);
         g_error_free(error);
-        g_object_unref(payload->msg);
-        delete payload;
         return;
     }
 
@@ -176,8 +185,6 @@ static void on_soup_response(GObject *source,
         static_cast<const gchar *>(g_bytes_get_data(bytes, &data_size));
     std::string json_str(data, data_size);
     g_bytes_unref(bytes);
-    g_object_unref(payload->msg);
-    delete payload;
 
     try {
         json parsed = json::parse(json_str);
@@ -232,13 +239,17 @@ static void do_lookup(AppData *app)
     gtk_widget_set_sensitive(app->lookup_button, FALSE);
 
     SoupMessage *msg = soup_message_new(SOUP_METHOD_GET, url.c_str());
-    auto *payload = new LookupPayload{app, g_object_ref(msg)};
+    // Use unique_ptr for safe construction; release() transfers ownership
+    // to the C callback (reclaimed via unique_ptr in on_soup_response).
+    auto payload = std::make_unique<LookupPayload>(
+        LookupPayload{app, GObjectPtr<SoupMessage>(
+                               static_cast<SoupMessage *>(g_object_ref(msg)))});
 
     soup_session_send_and_read_async(app->session, msg,
                                      G_PRIORITY_DEFAULT,
                                      nullptr,
                                      on_soup_response,
-                                     payload);
+                                     payload.release());
     g_object_unref(msg);
 }
 
